@@ -3,79 +3,52 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Print from "./Print";
 import { inkAt } from "@/lib/config";
-import { withFrac } from "@/lib/position";
+import { SIZE, RX, RY, hasWorld, legacyWorld } from "@/lib/position";
 import html2canvas from "html2canvas";
 
 const OK = /^[A-Za-z0-9_]{1,15}$/;
 const same = (a, b) => a.toLowerCase() === b.toLowerCase();
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const MIN_S = 0.1, MAX_S = 3;
 
 const tf = (x, y) =>
   `translate3d(${x.toFixed(2)}px,${y.toFixed(2)}px,0) translate(-50%,-50%)`;
 
-/*
-  Positions are stored as fractions (fx, fy: 0..1) of the usable board area,
-  so every screen shows the same arrangement, spread over its own full size.
-  Everything below works in pixels for the current screen.
-*/
-const sizeFor = (w) => clamp(w * 0.09, 44, 88);
+const clear = (x, y, others) =>
+  others.every((p) => Math.hypot((x - p.x) / RX, (y - p.y) / RY) >= 0.98);
 
-function geometry(w, h) {
-  const size = sizeFor(w);
-  const mh = size * 1.24 + 14; // print + @handle label
-  const top = 56 + mh / 2; // below the title
-  const bottom = 96 + mh / 2; // above the bottom bar
-  return {
-    size,
-    // keep-out ellipse around every print (prints are taller than wide)
-    rx: size * 1.15,
-    ry: size * 1.6,
-    minX: size * 0.6,
-    maxX: w - size * 0.6,
-    minY: top,
-    maxY: Math.max(top, h - bottom),
-  };
-}
-
-const toPx = (p, g) => ({
-  x: g.minX + p.fx * (g.maxX - g.minX),
-  y: g.minY + p.fy * (g.maxY - g.minY),
-});
-
-const toFrac = (x, y, g) => ({
-  fx: clamp((x - g.minX) / (g.maxX - g.minX || 1), 0, 1),
-  fy: clamp((y - g.minY) / (g.maxY - g.minY || 1), 0, 1),
-});
-
-// Push a point out of every neighbour so prints never overlap on this screen.
-function resolve(x, y, others, g) {
-  const fit = () => {
-    x = clamp(x, g.minX, g.maxX);
-    y = clamp(y, g.minY, g.maxY);
-  };
-  fit();
+// Push a point out of every neighbour. Returns null if it cannot find room.
+function resolve(x, y, others) {
   for (let i = 0; i < 8; i++) {
     let hit = false;
     for (const p of others) {
-      const dx = (x - p.x) / g.rx;
-      const dy = (y - p.y) / g.ry;
-      const d = Math.hypot(dx, dy);
+      const dx = (x - p.x) / RX, dy = (y - p.y) / RY, d = Math.hypot(dx, dy);
       if (d < 1) {
-        x = p.x + (d ? dx / d : 1) * g.rx;
-        y = p.y + (d ? dy / d : 0) * g.ry;
-        fit();
+        x = p.x + (d ? dx / d : 1) * RX;
+        y = p.y + (d ? dy / d : 0) * RY;
         hit = true;
       }
     }
     if (!hit) break;
   }
-  const free = others.every(
-    (p) => Math.hypot((x - p.x) / g.rx, (y - p.y) / g.ry) >= 0.98
-  );
-  return free ? { x, y } : null;
+  return clear(x, y, others) ? { x, y } : null;
 }
 
-function Live({ p, size }) {
+// Like resolve, but spirals outward until it finds a free spot (canvas has no edge).
+function freeSpot(x, y, others) {
+  const r = resolve(x, y, others);
+  if (r) return r;
+  for (let k = 1; k < 80; k++)
+    for (let a = 0; a < 12; a++) {
+      const t = (a / 12) * 2 * Math.PI;
+      const px = x + Math.cos(t) * k * RX * 0.5;
+      const py = y + Math.sin(t) * k * RY * 0.5;
+      if (clear(px, py, others)) return { x: px, y: py };
+    }
+  return { x, y };
+}
+
+function Live({ p }) {
   const [ink, setInk] = useState(p.ink ?? 0.3);
 
   useEffect(() => {
@@ -95,7 +68,7 @@ function Live({ p, size }) {
   return (
     <div className="mark live" style={{ transform: tf(p.x, p.y) }}>
       <div className="pin">
-        <Print seed={p.seed} ink={ink} rot={p.rot} size={size} />
+        <Print seed={p.seed} ink={ink} rot={p.rot} size={SIZE} />
       </div>
     </div>
   );
@@ -112,40 +85,97 @@ export default function Page() {
   const [box, setBox] = useState({ w: 0, h: 0 });
 
   const paper = useRef(null);
+  const worldRef = useRef(null);
   const captureRef = useRef(null);
+  const viewRef = useRef({ tx: 0, ty: 0, s: 1 });
+  const ptrs = useRef(new Map());
+  const gest = useRef(null);
+  const moved = useRef(false);
+  const didFit = useRef(false);
+  const raf = useRef(0);
+  const idle = useRef(0);
   const cur = useRef(null);
   const drag = useRef(null);
   const first = useRef(true);
-  const gRef = useRef(null);
   const laidRef = useRef({});
 
-  const g = useMemo(
-    () => (box.w ? geometry(box.w, box.h) : null),
-    [box.w, box.h]
-  );
-  gRef.current = g;
-
-  // Pixel position of every print on THIS screen, oldest first, never overlapping.
+  // Position of every print in world units. Saved positions are fixed;
+  // old prints are laid out once around them, oldest first, never overlapping.
   const laid = useMemo(() => {
-    if (!g) return {};
-    const placed = [];
     const out = {};
-    for (const p of [...prints].sort((a, b) => (a.t || 0) - (b.t || 0))) {
-      const raw = toPx(p, g);
-      const pos = resolve(raw.x, raw.y, placed, g) || raw;
-      placed.push(pos);
+    const placed = [];
+    for (const p of prints)
+      if (hasWorld(p)) {
+        out[p.u] = { x: p.wx, y: p.wy };
+        placed.push(out[p.u]);
+      }
+    const old = prints.filter((p) => !hasWorld(p)).sort((a, b) => (a.t || 0) - (b.t || 0));
+    for (const p of old) {
+      const w = legacyWorld(p);
+      const pos = freeSpot(w.wx, w.wy, placed);
       out[p.u] = pos;
+      placed.push(pos);
     }
     return out;
-  }, [prints, g]);
+  }, [prints]);
   laidRef.current = laid;
+
+  // ---- view (pan / zoom), applied straight to the DOM for smoothness ----
+  // While moving, the canvas is promoted to its own layer (class "moving") so the
+  // browser just slides a picture instead of redrawing every print. It is redrawn
+  // sharp ~160ms after you stop. Writes are batched to one per frame.
+  function setView(v) {
+    viewRef.current = v;
+    const w = worldRef.current;
+    if (!w) return;
+    w.classList.add("moving");
+    clearTimeout(idle.current);
+    idle.current = setTimeout(() => w.classList.remove("moving"), 160);
+    if (!raf.current)
+      raf.current = requestAnimationFrame(() => {
+        raf.current = 0;
+        const c = viewRef.current;
+        w.style.transform = `translate(${c.tx}px,${c.ty}px) scale(${c.s})`;
+      });
+  }
+
+  function zoomAt(cx, cy, factor) {
+    const v = viewRef.current;
+    const s = clamp(v.s * factor, MIN_S, MAX_S);
+    const k = s / v.s;
+    setView({ s, tx: cx - (cx - v.tx) * k, ty: cy - (cy - v.ty) * k });
+  }
+
+  const toWorld = (cx, cy) => {
+    const r = paper.current.getBoundingClientRect();
+    const v = viewRef.current;
+    return { x: (cx - r.left - v.tx) / v.s, y: (cy - r.top - v.ty) / v.s };
+  };
+
+  function fitAll(initial) {
+    const pts = Object.values(laidRef.current);
+    if (!pts.length || !box.w) return;
+    const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    let s = Math.min(box.w / (maxX - minX + 2 * RX), (box.h - 160) / (maxY - minY + 2 * RY));
+    s = clamp(s, MIN_S, 1);
+    let cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    if (initial && box.w < 640 && s < 0.5) {
+      // on a phone, start readable and centred on your own print
+      s = 0.5;
+      const m = me && laidRef.current[me.u];
+      if (m) { cx = m.x; cy = m.y; }
+    }
+    setView({ s, tx: box.w / 2 - cx * s, ty: box.h / 2 + 10 - cy * s });
+  }
 
   const load = () =>
     fetch("/api/prints")
       .then((r) => r.json())
       .then((d) => {
         const list = (d.prints || []).map((p) =>
-          withFrac(first.current ? { ...p, intro: true } : p)
+          first.current ? { ...p, intro: true } : p
         );
         first.current = false;
         setPrints(list);
@@ -165,12 +195,32 @@ export default function Page() {
       setBox({ w: el.clientWidth, h: el.clientHeight })
     );
     ro.observe(el);
-    return () => ro.disconnect();
+
+    // Ctrl/Cmd + scroll (or trackpad pinch) zooms, plain scroll pans.
+    const wheel = (e) => {
+      e.preventDefault();
+      const v = viewRef.current;
+      if (e.ctrlKey || e.metaKey) {
+        const r = el.getBoundingClientRect();
+        zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-clamp(e.deltaY, -50, 50) * 0.01));
+      } else setView({ ...v, tx: v.tx - e.deltaX, ty: v.ty - e.deltaY });
+    };
+    el.addEventListener("wheel", wheel, { passive: false });
+    return () => {
+      ro.disconnect();
+      el.removeEventListener("wheel", wheel);
+    };
   }, []);
+
+  // Show everything once, the first time prints and screen size are known.
+  useEffect(() => {
+    if (didFit.current || !box.w || !prints.length) return;
+    didFit.current = true;
+    fitAll(true);
+  }, [box.w, prints.length]);
 
   const mine = me && prints.find((p) => same(p.u, me.u));
   const user = name.replace(/^@/, "").trim();
-  const size = g ? g.size : 44;
 
   const others = (skipUser) =>
     prints
@@ -188,18 +238,13 @@ export default function Page() {
     setStep("armed");
   };
 
-  // Place a new thumbprint.
-  const down = (e) => {
-    if (step !== "armed" || cur.current || !gRef.current) return;
-    const r = paper.current.getBoundingClientRect();
-    const pos = resolve(
-      e.clientX - r.left,
-      e.clientY - r.top,
-      others(),
-      gRef.current
-    );
+  // Place a new thumbprint (hold to ink).
+  const place = (e) => {
+    if (cur.current) return;
+    const w0 = toWorld(e.clientX, e.clientY);
+    const pos = resolve(w0.x, w0.y, others());
     if (!pos) {
-      setMsg("No free space here. Try another spot.");
+      setMsg("No free space here. Try another spot or pan to an empty area.");
       return;
     }
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -223,13 +268,7 @@ export default function Page() {
 
     const res = await fetch("/api/prints", {
       method: "POST",
-      body: JSON.stringify({
-        u: user,
-        ...toFrac(c.x, c.y, gRef.current),
-        seed: c.seed,
-        rot: c.rot,
-        ink,
-      }),
+      body: JSON.stringify({ u: user, wx: c.x, wy: c.y, seed: c.seed, rot: c.rot, ink }),
     });
     const data = await res.json();
     setLive(null);
@@ -253,7 +292,67 @@ export default function Page() {
     load();
   };
 
-  // Smooth dragging animation.
+  // ---- background gestures: drag to pan, two fingers to pinch ----
+  const pDown = (e) => {
+    if (step === "armed") return place(e);
+    ptrs.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const v = viewRef.current;
+    if (ptrs.current.size === 1)
+      gest.current = { type: "pan", x: e.clientX, y: e.clientY, tx: v.tx, ty: v.ty, moved: false };
+    else if (ptrs.current.size === 2) {
+      const [a, b] = [...ptrs.current.values()];
+      gest.current = {
+        type: "pinch",
+        d: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+        cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2,
+        s: v.s, tx: v.tx, ty: v.ty,
+      };
+    }
+  };
+
+  const pMove = (e) => {
+    if (!ptrs.current.has(e.pointerId)) return;
+    ptrs.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const g = gest.current;
+    if (!g) return;
+
+    if (g.type === "pan" && ptrs.current.size === 1) {
+      const dx = e.clientX - g.x, dy = e.clientY - g.y;
+      if (!g.moved) {
+        if (Math.hypot(dx, dy) < 5) return;
+        g.moved = true;
+        moved.current = true;
+        paper.current.setPointerCapture(e.pointerId);
+        paper.current.classList.add("panning");
+      }
+      setView({ ...viewRef.current, tx: g.tx + dx, ty: g.ty + dy });
+    } else if (g.type === "pinch" && ptrs.current.size >= 2) {
+      const [a, b] = [...ptrs.current.values()];
+      const r = paper.current.getBoundingClientRect();
+      const s = clamp(g.s * (Math.hypot(a.x - b.x, a.y - b.y) / g.d), MIN_S, MAX_S);
+      const wx = (g.cx - r.left - g.tx) / g.s, wy = (g.cy - r.top - g.ty) / g.s;
+      setView({
+        s,
+        tx: (a.x + b.x) / 2 - r.left - wx * s,
+        ty: (a.y + b.y) / 2 - r.top - wy * s,
+      });
+    }
+  };
+
+  const pUp = (e) => {
+    if (cur.current) return up();
+    ptrs.current.delete(e.pointerId);
+    const left = [...ptrs.current.values()];
+    const v = viewRef.current;
+    if (!left.length) {
+      gest.current = null;
+      paper.current.classList.remove("panning");
+      setTimeout(() => (moved.current = false), 0);
+    } else if (left.length === 1)
+      gest.current = { type: "pan", x: left[0].x, y: left[0].y, tx: v.tx, ty: v.ty, moved: true };
+  };
+
+  // ---- dragging your own print ----
   const loop = (t) => {
     const d = drag.current;
     if (!d) return;
@@ -266,7 +365,6 @@ export default function Page() {
     d.raf = requestAnimationFrame(loop);
   };
 
-  // Grab your own thumbprint.
   const grab = (e) => {
     if (step === "armed") return;
     e.preventDefault();
@@ -275,42 +373,32 @@ export default function Page() {
     if (!m) return;
 
     const el = e.currentTarget;
-    const r = paper.current.getBoundingClientRect();
+    const w0 = toWorld(e.clientX, e.clientY);
     el.setPointerCapture(e.pointerId);
     el.classList.add("dragging");
 
     drag.current = {
       el,
-      offX: e.clientX - (r.left + m.x),
-      offY: e.clientY - (r.top + m.y),
-      x: m.x,
-      y: m.y,
-      dx: m.x,
-      dy: m.y,
-      start: { x: m.x, y: m.y, fx: mine.fx, fy: mine.fy },
+      offX: w0.x - m.x,
+      offY: w0.y - m.y,
+      x: m.x, y: m.y, dx: m.x, dy: m.y,
+      start: { x: m.x, y: m.y, wx: mine.wx, wy: mine.wy },
       last: performance.now(),
     };
     drag.current.raf = requestAnimationFrame(loop);
   };
 
-  // Move your own thumbprint, keeping it inside the board and off its neighbours.
   const dragMove = (e) => {
     const d = drag.current;
-    if (!d || !gRef.current) return;
-    const r = paper.current.getBoundingClientRect();
-    const pos = resolve(
-      e.clientX - d.offX - r.left,
-      e.clientY - d.offY - r.top,
-      others(me.u),
-      gRef.current
-    );
+    if (!d) return;
+    const w0 = toWorld(e.clientX, e.clientY);
+    const pos = resolve(w0.x - d.offX, w0.y - d.offY, others(me.u));
     if (pos) {
       d.x = pos.x;
       d.y = pos.y;
     }
   };
 
-  // Drop your thumbprint and save its position.
   const drop = async () => {
     const d = drag.current;
     if (!d) return;
@@ -320,33 +408,29 @@ export default function Page() {
     d.el.style.transform = tf(d.x, d.y);
 
     const setPos = (pos) =>
-      setPrints((ps) =>
-        ps.map((p) => (same(p.u, me.u) ? { ...p, ...pos } : p))
-      );
+      setPrints((ps) => ps.map((p) => (same(p.u, me.u) ? { ...p, ...pos } : p)));
 
-    const f = toFrac(d.x, d.y, gRef.current);
-    setPos(f);
+    setPos({ wx: d.x, wy: d.y });
 
     const res = await fetch("/api/prints", {
       method: "PATCH",
-      body: JSON.stringify({ u: me.u, token: me.token, ...f }),
+      body: JSON.stringify({ u: me.u, token: me.token, wx: d.x, wy: d.y }),
     });
 
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      setPos({ fx: d.start.fx, fy: d.start.fy });
+      setPos({ wx: d.start.wx, wy: d.start.wy });
       d.el.style.transform = tf(d.start.x, d.start.y);
       setMsg(data.error || "Could not move your print.");
       setTimeout(() => setMsg(""), 3000);
     }
   };
 
-  // Share: screenshot the current page, download it, open X.
+  // Share: screenshot what you see, download it, open X.
   const share = async () => {
     const text = "I left my thumbprint on the page. Add yours:";
     try {
       if (!captureRef.current) return;
-
       const canvas = await html2canvas(captureRef.current, {
         backgroundColor: "#ffffff",
         scale: Math.min(window.devicePixelRatio || 1, 2),
@@ -357,10 +441,7 @@ export default function Page() {
         windowWidth: window.innerWidth,
         windowHeight: window.innerHeight,
       });
-
-      const blob = await new Promise((resolve) =>
-        canvas.toBlob(resolve, "image/png")
-      );
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
       if (!blob) throw new Error("Failed to create PNG");
 
       const url = URL.createObjectURL(blob);
@@ -388,12 +469,7 @@ export default function Page() {
     <div ref={captureRef} className="capture-area">
       <svg width="0" height="0" style={{ position: "absolute" }}>
         <filter id="rough">
-          <feTurbulence
-            type="fractalNoise"
-            baseFrequency="0.9"
-            numOctaves="2"
-            result="n"
-          />
+          <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" result="n" />
           <feDisplacementMap in="SourceGraphic" in2="n" scale="1.3" />
         </filter>
       </svg>
@@ -408,24 +484,30 @@ export default function Page() {
       <main
         ref={paper}
         className={`paper ${step === "armed" ? "armed" : ""}`}
-        onPointerDown={down}
-        onPointerUp={up}
-        onPointerCancel={up}
+        onPointerDown={pDown}
+        onPointerMove={pMove}
+        onPointerUp={pUp}
+        onPointerCancel={pUp}
+        onClickCapture={(e) => {
+          if (moved.current) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+        }}
         onContextMenu={(e) => e.preventDefault()}
       >
-        {g && !total && !live && (
+        {box.w > 0 && !total && !live && (
           <p className="empty">Nobody has left a print yet.</p>
         )}
 
-        {g &&
-          prints.map((p) => {
+        <div ref={worldRef} className="world">
+          {prints.map((p) => {
             const at = laid[p.u];
             if (!at) return null;
             const pos = { transform: tf(at.x, at.y) };
-
             const art = (
               <div className="pin">
-                <Print seed={p.seed} ink={p.ink} rot={p.rot} size={size} />
+                <Print seed={p.seed} ink={p.ink} rot={p.rot} size={SIZE} />
               </div>
             );
 
@@ -459,8 +541,15 @@ export default function Page() {
             );
           })}
 
-        {g && live && <Live p={live} size={size} />}
+          {live && <Live p={live} />}
+        </div>
       </main>
+
+      <div className="zoom" data-html2canvas-ignore="true">
+        <button aria-label="Zoom out" onClick={() => zoomAt(box.w / 2, box.h / 2, 1 / 1.3)}>−</button>
+        <button aria-label="Zoom in" onClick={() => zoomAt(box.w / 2, box.h / 2, 1.3)}>+</button>
+        <button className="fit" aria-label="Show all prints" onClick={() => fitAll(false)}>Fit</button>
+      </div>
 
       <div className="bar">
         {msg && (

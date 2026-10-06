@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { add, list, find, move } from "@/lib/store";
-import { withFrac, c01 } from "@/lib/position";
+import { legacyWorld, LIMIT } from "@/lib/position";
 
 export const dynamic = "force-dynamic";
 
@@ -9,10 +9,13 @@ const hash = (t) => crypto.createHash("sha256").update(String(t)).digest("hex");
 const cleanName = (s) => String(s || "").replace(/^@/, "").trim();
 const validName = (s) => /^[A-Za-z0-9_]{1,15}$/.test(s);
 
-// Accepts fx/fy (new) or x/y (a stale tab still running the old JS).
+// Accepts wx/wy (new) or the older fx/fy and x/y (a stale tab running old JS).
 const pos = (b) => {
-  const f = withFrac({ x: b.x, y: b.y, fx: b.fx, fy: b.fy });
-  return { fx: c01(f.fx), fy: c01(f.fy) };
+  const wx = Number(b.wx), wy = Number(b.wy);
+  if (Number.isFinite(wx) && Number.isFinite(wy))
+    return { wx: clamp(wx, -LIMIT, LIMIT), wy: clamp(wy, -LIMIT, LIMIT) };
+  const w = legacyWorld({ x: b.x, y: b.y, fx: b.fx, fy: b.fy });
+  return { wx: w.wx, wy: w.wy };
 };
 
 export async function GET() {
@@ -46,7 +49,7 @@ export async function PATCH(req) {
   const doc = await find(k);
   if (!doc || doc.h !== hash(body.token)) return Response.json({ error: "This print is not yours to move." }, { status: 403 });
 
-  const { fx, fy } = pos(body);
-  await move(k, fx, fy);
-  return Response.json({ ok: true, fx, fy });
+  const { wx, wy } = pos(body);
+  await move(k, wx, wy);
+  return Response.json({ ok: true, wx, wy });
 }
