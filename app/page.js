@@ -152,23 +152,87 @@ export default function Page() {
     return { x: (cx - r.left - v.tx) / v.s, y: (cy - r.top - v.ty) / v.s };
   };
 
-  function fitAll(initial) {
-    const pts = Object.values(laidRef.current);
-    if (!pts.length || !box.w) return;
-    const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
-    const minX = Math.min(...xs), maxX = Math.max(...xs);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
-    let s = Math.min(box.w / (maxX - minX + 2 * RX), (box.h - 160) / (maxY - minY + 2 * RY));
-    s = clamp(s, MIN_S, 1);
-    let cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-    if (initial && box.w < 640 && s < 0.5) {
-      // on a phone, start readable and centred on your own print
-      s = 0.5;
-      const m = me && laidRef.current[me.u];
-      if (m) { cx = m.x; cy = m.y; }
+  function fitAll(initial = false) {
+  const pts = Object.values(laidRef.current);
+
+  if (!pts.length || !box.w) return;
+
+  /*
+   * Use the main cluster of prints instead of extreme outliers.
+   *
+   * We find the median X/Y and only use prints reasonably close
+   * to that center when calculating the camera.
+   */
+  const xs = pts.map((p) => p.x).sort((a, b) => a - b);
+  const ys = pts.map((p) => p.y).sort((a, b) => a - b);
+
+  const median = (arr) => {
+    const mid = Math.floor(arr.length / 2);
+    return arr.length % 2
+      ? arr[mid]
+      : (arr[mid - 1] + arr[mid]) / 2;
+  };
+
+  const centerX = median(xs);
+  const centerY = median(ys);
+
+  // Ignore prints that are extremely far away from the main cluster.
+  const MAX_CLUSTER_DISTANCE = 3500;
+
+  const cluster = pts.filter(
+    (p) =>
+      Math.hypot(
+        (p.x - centerX),
+        (p.y - centerY)
+      ) <= MAX_CLUSTER_DISTANCE
+  );
+
+  const visiblePts = cluster.length ? cluster : pts;
+
+  const clusterXs = visiblePts.map((p) => p.x);
+  const clusterYs = visiblePts.map((p) => p.y);
+
+  const minX = Math.min(...clusterXs);
+  const maxX = Math.max(...clusterXs);
+  const minY = Math.min(...clusterYs);
+  const maxY = Math.max(...clusterYs);
+
+  let s = Math.min(
+    box.w / (maxX - minX + 2 * RX),
+    (box.h - 160) / (maxY - minY + 2 * RY)
+  );
+
+  /*
+   * Don't zoom out too far.
+   * This keeps the canvas readable even when there are
+   * a few prints far away.
+   */
+  s = clamp(s, 0.5, 1);
+
+  let cx = (minX + maxX) / 2;
+  let cy = (minY + maxY) / 2;
+
+  /*
+   * On initial load, prefer a comfortable view rather than
+   * trying to show the entire cluster.
+   */
+  if (initial) {
+    s = Math.max(s, 0.65);
+
+    const m = me && laidRef.current[me.u];
+
+    if (m) {
+      cx = m.x;
+      cy = m.y;
     }
-    setView({ s, tx: box.w / 2 - cx * s, ty: box.h / 2 + 10 - cy * s });
   }
+
+  setView({
+    s,
+    tx: box.w / 2 - cx * s,
+    ty: box.h / 2 + 10 - cy * s,
+  });
+}
 
   const load = () =>
     fetch("/api/prints")
